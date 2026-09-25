@@ -404,15 +404,19 @@ async def _analyze_payments(ctx: AgentContext) -> None:
 
     for order_id in ctx.resolved_order_ids:
         try:
-            # Get order payments
+            # Get order payments (returns list)
             evidence = await gateway.call("get_order_payments", case_id=case_id, order_id=order_id)
             ctx.evidence_refs.append(evidence["evidence_ref"])
-            payment = evidence["data"]
-            ctx.payment_data[order_id] = payment
-
-            if "payment_reference" in payment:
-                ctx.affected_entities["payment_references"].append(payment["payment_reference"])
-
+            payments = evidence["data"]
+            
+            # payments is a list of payment records
+            if isinstance(payments, list):
+                ctx.payment_data[order_id] = {"payments": payments}
+                # Extract payment references
+                for i, p in enumerate(payments):
+                    if f"payment_ref_{i}" not in ctx.affected_entities["payment_references"]:
+                        ctx.affected_entities["payment_references"].append(f"payment_ref_{i}_{order_id}")
+            
             trace.emit(
                 case_id=case_id,
                 event_type="tool_result_consumed",
@@ -421,22 +425,24 @@ async def _analyze_payments(ctx: AgentContext) -> None:
                 evidence_refs=[evidence["evidence_ref"]],
             )
 
-            # Get payment timeline
-            if "payment_reference" in payment:
-                try:
-                    timeline_evidence = await gateway.call(
-                        "get_payment_timeline", case_id=case_id, payment_reference=payment["payment_reference"]
-                    )
-                    ctx.evidence_refs.append(timeline_evidence["evidence_ref"])
-                    trace.emit(
-                        case_id=case_id,
-                        event_type="tool_result_consumed",
-                        actor="payment-agent",
-                        tool_name="get_payment_timeline",
-                        evidence_refs=[timeline_evidence["evidence_ref"]],
-                    )
-                except Exception:
-                    pass
+            # Get payment timeline for each payment
+            if isinstance(payments, list):
+                for i, p in enumerate(payments):
+                    payment_ref = p.get("payment_reference") or f"payment_{order_id}_{i}"
+                    try:
+                        timeline_evidence = await gateway.call(
+                            "get_payment_timeline", case_id=case_id, payment_reference=payment_ref
+                        )
+                        ctx.evidence_refs.append(timeline_evidence["evidence_ref"])
+                        trace.emit(
+                            case_id=case_id,
+                            event_type="tool_result_consumed",
+                            actor="payment-agent",
+                            tool_name="get_payment_timeline",
+                            evidence_refs=[timeline_evidence["evidence_ref"]],
+                        )
+                    except Exception:
+                        pass
 
         except Exception as e:
             trace.emit(
@@ -597,32 +603,41 @@ def _classify_primary_issue(ctx: AgentContext, policies: dict[str, Any]) -> str:
 
     # Check order status
     for order in ctx.order_data.values():
-        status = order.get("status", "")
+        status = order.get("order_status", order.get("status", ""))
         if status == "canceled" and ctx.payment_data:
             return "canceled_order_paid"
         if status == "unavailable":
             return "unavailable_order_paid"
 
-    # Check payment status
-    for payment in ctx.payment_data.values():
-        if payment.get("status") == "failed":
-            return "payment_mismatch"
-        if payment.get("refund_status") == "pending":
-            return "refund_pending"
-        if payment.get("refund_status") == "failed":
-            return "refund_failed"
+    # Check payment status - handle both dict and list formats
+    for order_id, payment_info in ctx.payment_data.items():
+        payments = payment_info.get("payments", [payment_info]) if isinstance(payment_info, dict) else payment_info
+        for payment in payments:
+            if payment.get("payment_type") == "failed":
+                return "payment_mismatch"
+            # Check refund status in payment info
+            if isinstance(payment_info, dict) and payment_info.get("refund_status") == "pending":
+                return "refund_pending"
+            if isinstance(payment_info, dict) and payment_info.get("refund_status") == "failed":
+                return "refund_failed"
 
     # Check shipment status
     for shipment in ctx.shipment_data.values():
-        estimated = shipment.get("estimated_delivery")
-        delivered = shipment.get("delivered_at")
+        estimated = shipment.get("estimated_delivery_date", shipment.get("estimated_delivery"))
+        delivered = shipment.get("delivered_at", shipment.get("order_delivered_customer_date"))
         if estimated and delivered:
-            if delivered > estimated:
-                return "late_delivery_seller"  # Default assumption
+            try:
+                if delivered > estimated:
+                    return "late_delivery_seller"  # Default assumption
+            except TypeError:
+                pass
 
     # Check for duplicates
-    payment_refs = list({p.get("payment_reference") for p in ctx.payment_data.values() if p.get("payment_reference")})
-    if len(payment_refs) > len(ctx.resolved_order_ids):
+    total_payments = sum(
+        len(p.get("payments", [p])) if isinstance(p, dict) else len(p) 
+        for p in ctx.payment_data.values()
+    )
+    if total_payments > len(ctx.resolved_order_ids):
         return "duplicate_charge"
 
     return "insufficient_evidence"
@@ -660,18 +675,24 @@ def _generate_resolution_actions(ctx: AgentContext, policies: dict[str, Any]) ->
 
             # Payment-based actions
             if order_id in ctx.payment_data:
-                payment = ctx.payment_data[order_id]
-                if payment.get("status") == "captured":
-                    if payment.get("refund_status") in (None, ""):
-                        actions.append("process_refund_for_order")
-                    elif payment.get("refund_status") == "pending":
-                        actions.append("follow_up_pending_refund")
+                payment_info = ctx.payment_data[order_id]
+                payments = payment_info.get("payments", [payment_info]) if isinstance(payment_info, dict) else payment_info
+                for payment in payments:
+                    if payment.get("payment_value"):
+                        actions.append("process_payment_for_order")
+                        if payment.get("payment_type"):
+                            actions.append(f"handle_{payment['payment_type']}_payment")
 
             # Shipment-based actions
             if order_id in ctx.shipment_data:
                 shipment = ctx.shipment_data[order_id]
-                if shipment.get("status") == "delivered_late":
-                    actions.append("apply_late_delivery_compensation")
+                delivery_date = shipment.get("order_delivered_customer_date")
+                estimated_date = shipment.get("order_estimated_delivery_date")
+                if delivery_date and estimated_date:
+                    if delivery_date > estimated_date:
+                        actions.append("apply_late_delivery_compensation")
+                    else:
+                        actions.append("confirm_delivery_complete")
 
     return list(set(actions))[:8]  # Max 8 unique actions
 
@@ -695,14 +716,18 @@ async def _resolve_conflicts(ctx: AgentContext) -> None:
             continue
 
         order = ctx.order_data[order_id]
-        payment = ctx.payment_data[order_id]
+        payment_info = ctx.payment_data[order_id]
+        payments = payment_info.get("payments", [payment_info]) if isinstance(payment_info, dict) else payment_info
 
         # Calculate expected vs actual
-        order_total = sum(item.get("price", 0) * item.get("quantity", 1) for item in order.get("items", []))
-        payment_captured = payment.get("amount", 0)
+        order_total = sum(
+            float(item.get("price", 0)) * int(item.get("quantity", 1)) 
+            for item in order.get("items", [])
+        )
+        payment_total = sum(float(p.get("payment_value", 0)) for p in payments)
 
-        if order_total and payment_captured:
-            diff = abs(order_total - payment_captured)
+        if order_total and payment_total:
+            diff = abs(order_total - payment_total)
             if diff > 0.01:  # Allow for rounding
                 ctx.data_conflicts.append({
                     "field": "order_total_vs_payment",
@@ -719,21 +744,19 @@ async def _resolve_conflicts(ctx: AgentContext) -> None:
         order = ctx.order_data[order_id]
         shipment = ctx.shipment_data[order_id]
 
-        order_date = order.get("order_date")
-        delivery_date = shipment.get("delivered_at")
+        order_date = order.get("order_purchase_timestamp")
+        delivery_date = shipment.get("order_delivered_customer_date")
 
         if order_date and delivery_date:
             try:
-                order_dt = datetime.fromisoformat(order_date.replace("Z", "+00:00"))
-                delivery_dt = datetime.fromisoformat(delivery_date.replace("Z", "+00:00"))
-                if delivery_dt < order_dt:
+                if delivery_date < order_date:
                     ctx.data_conflicts.append({
                         "field": "timeline",
                         "sources": ["order_date", "delivery_date"],
                         "selected_source": "delivery_date",
                         "resolution_code": "LATER_DATE_PRECEDENCE",
                     })
-            except Exception:
+            except TypeError:
                 pass
 
     trace.emit(case_id=case_id, event_type="handoff", actor="conflict-resolver", target="verifier")
@@ -814,6 +837,18 @@ def _build_output(ctx: AgentContext) -> dict[str, Any]:
     # Build assessment
     primary_issue = _classify_primary_issue(ctx, {})
 
+    # Build related_order_ids safely
+    related_ids = list(ctx.resolved_order_ids)
+    if ctx.customer_history:
+        if isinstance(ctx.customer_history, dict):
+            customer_orders = ctx.customer_history.get("orders", [])
+            if isinstance(customer_orders, list):
+                related_ids.extend([o.get("order_id", o) for o in customer_orders if isinstance(o, dict)])
+            elif isinstance(customer_orders, str):
+                related_ids.append(customer_orders)
+        elif isinstance(ctx.customer_history, list):
+            related_ids.extend([o.get("order_id", o) if isinstance(o, dict) else o for o in ctx.customer_history])
+
     return {
         "schema_version": "day09-l3b-output-v2",
         "case_id": ctx.case_id,
@@ -824,11 +859,11 @@ def _build_output(ctx: AgentContext) -> dict[str, Any]:
             "confidence": _calibrate_confidence(ctx),
         },
         "affected_entities": {
-            "order_ids": ctx.affected_entities["order_ids"][:20],
-            "item_ids": ctx.affected_entities["item_ids"][:20],
-            "seller_ids": ctx.affected_entities["seller_ids"][:20],
-            "payment_references": ctx.affected_entities["payment_references"][:20],
-            "shipment_ids": ctx.affected_entities["shipment_ids"][:20],
+            "order_ids": list(set(ctx.affected_entities["order_ids"]))[:20],
+            "item_ids": list(set(ctx.affected_entities["item_ids"]))[:20],
+            "seller_ids": list(set(ctx.affected_entities["seller_ids"]))[:20],
+            "payment_references": list(set(ctx.affected_entities["payment_references"]))[:20],
+            "shipment_ids": list(set(ctx.affected_entities["shipment_ids"]))[:20],
         },
         "claim_assessments": ctx.claim_assessments[:5],
         "entity_resolution": {
@@ -839,15 +874,12 @@ def _build_output(ctx: AgentContext) -> dict[str, Any]:
         },
         "customer_context": {
             "customer_unique_id": ctx.customer_unique_id,
-            "related_order_ids": list(set(
-                ctx.resolved_order_ids +
-                ([ctx.customer_history.get("order_ids", [])] if ctx.customer_history else [])
-            ))[:20],
+            "related_order_ids": list(set(related_ids))[:20],
         },
         "shipment_analysis": _build_shipment_analysis(ctx),
         "payment_analysis": _build_payment_analysis(ctx),
         "root_cause_analysis": _build_root_cause_analysis(ctx),
-        "evidence_refs": ctx.evidence_refs[:30],
+        "evidence_refs": list(set(ctx.evidence_refs))[:30],
         "data_conflicts": ctx.data_conflicts[:5],
         "financial_resolution": financial_resolution,
         "resolution_actions": ctx.resolution_actions[:8],
@@ -862,19 +894,30 @@ def _build_shipment_analysis(ctx: AgentContext) -> dict[str, Any]:
     timeline_complete = False
 
     for shipment in ctx.shipment_data.values():
-        if shipment.get("status") == "delivered":
+        # Handle different field names
+        status = shipment.get("status", shipment.get("shipment_status", ""))
+        delivery_date = shipment.get("order_delivered_customer_date", shipment.get("delivered_at"))
+        estimated_date = shipment.get("order_estimated_delivery_date", shipment.get("estimated_delivery_date"))
+        seller_id = shipment.get("seller_id")
+
+        if status == "delivered" or delivery_date:
             timeline_complete = True
-            if shipment.get("delivered_at") and shipment.get("estimated_delivery"):
-                if shipment["delivered_at"] > shipment["estimated_delivery"]:
-                    verdict = "late_seller_delay"
-                    if shipment.get("seller_id"):
-                        late_seller_ids.append(shipment["seller_id"])
-        elif shipment.get("status") == "lost":
+            if delivery_date and estimated_date:
+                try:
+                    if delivery_date > estimated_date:
+                        verdict = "late_seller_delay"
+                        if seller_id:
+                            late_seller_ids.append(seller_id)
+                except TypeError:
+                    verdict = "insufficient_evidence"
+            elif status == "delivered":
+                verdict = "on_time"
+        elif status == "lost":
             verdict = "lost"
-        elif shipment.get("status") == "returned":
+        elif status == "returned":
             verdict = "returned"
-        elif shipment.get("status") == "delivered_on_time":
-            verdict = "on_time"
+        elif status == "in_transit":
+            verdict = "insufficient_evidence"
 
     return {
         "verdict": verdict,
@@ -891,22 +934,33 @@ def _build_payment_analysis(ctx: AgentContext) -> dict[str, Any]:
     refunded_total = 0.0
     refundable_total = 0.0
 
-    for payment in ctx.payment_data.values():
-        captured_total += payment.get("amount", 0)
-        if payment.get("refund_status") == "completed":
-            refunded_total += payment.get("refund_amount", 0)
-        elif payment.get("refund_status") == "pending":
-            refundable_total += payment.get("refund_amount", 0)
+    for order_id, payment_info in ctx.payment_data.items():
+        payments = payment_info.get("payments", [payment_info]) if isinstance(payment_info, dict) else payment_info
+        
+        for payment in payments:
+            value = payment.get("payment_value", payment.get("amount", 0))
+            if value:
+                try:
+                    captured_total += float(value)
+                except (ValueError, TypeError):
+                    pass
+            
+            # Check refund status
+            refund_status = payment_info.get("refund_status") if isinstance(payment_info, dict) else None
+            refund_amount = payment_info.get("refund_amount") if isinstance(payment_info, dict) else None
+            
+            if refund_status == "completed" and refund_amount:
+                refunded_total += float(refund_amount)
+            elif refund_status == "pending" and refund_amount:
+                refundable_total += float(refund_amount)
 
     if ctx.payment_data:
         if refunded_total > 0:
             verdict = "refunded"
         elif refunded_total == 0 and captured_total > 0:
             verdict = "reconciled"
-        elif "pending" in str(ctx.payment_data):
+        elif refundable_total > 0:
             verdict = "refund_pending"
-        elif "failed" in str(ctx.payment_data):
-            verdict = "refund_failed"
 
     return {
         "verdict": verdict,
@@ -948,12 +1002,27 @@ def _build_root_cause_analysis(ctx: AgentContext) -> dict[str, Any]:
 def _calculate_financial_resolution(ctx: AgentContext) -> dict[str, Any]:
     """Calculate financial resolution for refunds."""
 
-    captured_total = sum(
-        p.get("amount", 0) for p in ctx.payment_data.values()
-    )
-    refunded_total = sum(
-        r.get("amount", 0) for r in ctx.refund_data.values()
-    )
+    captured_total = 0.0
+    refunded_total = 0.0
+
+    for order_id, payment_info in ctx.payment_data.items():
+        payments = payment_info.get("payments", [payment_info]) if isinstance(payment_info, dict) else payment_info
+        for payment in payments:
+            value = payment.get("payment_value", payment.get("amount", 0))
+            if value:
+                try:
+                    captured_total += float(value)
+                except (ValueError, TypeError):
+                    pass
+
+    # Check refund data
+    for refund in ctx.refund_data.values():
+        amount = refund.get("amount", 0)
+        if amount:
+            try:
+                refunded_total += float(amount)
+            except (ValueError, TypeError):
+                pass
 
     recommended_refund = 0.0
     refund_lines = []
