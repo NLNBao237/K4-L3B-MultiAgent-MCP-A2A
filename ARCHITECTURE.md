@@ -42,7 +42,7 @@ Code: `src/student_agent/workflow.py` (agents, A2A, trace) and
 |---|---|---|---|---|
 | coordinator | case JSON | Dispatch, decide which optional evidence is needed | none | `task_assigned` to every agent |
 | entity-agent | candidates, customer hint | Resolve the complained order, reject candidates not owned by the customer, customer context | `get_customer_history` (fallback `get_order` per well-formed candidate) | `entity_resolved` |
-| order-agent | order id | Order row, items, sellers, product context; seller verification when policy blames a seller | `get_order`, `get_order_items`, `get_product_context`, `get_sellers` (conditional) | `order_analyzed`, `seller_verified` |
+| order-agent | order id | Order row, items, sellers; seller verification when policy blames a seller | `get_order`, `get_order_items`, `get_sellers` (conditional) | `order_analyzed`, `seller_verified` |
 | payment-agent | order id | Captures, reconciliation events, refund lifecycle | `get_payment_timeline`, `get_refund_timeline` (conditional) | `payment_timeline_collected`, `refund_timeline_collected` |
 | shipment-agent | order id | Carrier handoff vs shipping limit, delivery vs promise, late events | `get_shipment_summary` (conditional) | `shipment_analyzed` |
 | policy-agent | all findings | Classify primary issue, apply `EC_POLICY_V2` rule | `get_policy` | `policy_decided`, `issue_decided` |
@@ -157,10 +157,12 @@ seller ids observed in this case's items/sellers evidence.
 | Source conflict | 0 | conflict-agent decision | `handoff sources_reconciled` |
 | Invalid assembled output | 0 | verifier repairs, confidence −0.05 per fix | `verification_completed decision_code=CORRECTED` |
 
-Efficiency: 6 base calls (history, order, items, product, policy, payment timeline), plus
-shipment summary / refund timeline / sellers only when the decision needs them — 6–8 calls
-per case, never the unused `get_order_payments` (subsumed by the payment timeline) and never
-calls on malformed candidate ids.
+Efficiency: 5 base calls (history, order, items, policy, payment timeline), plus
+shipment summary / refund timeline / sellers only when the decision needs them — 5–7 calls
+per case. Never called: `get_order_payments` (subsumed by the payment timeline),
+`get_product_context` (category data never changes a decision; scored submissions showed
+that citing evidence that does not support the conclusion lowers evidence precision and
+efficiency), and malformed candidate ids.
 
 ## 7. Verification invariants
 
@@ -187,7 +189,7 @@ calls on malformed candidate ids.
 | `get_customer_history` | customer_unique_id | customer | always |
 | `get_order` | order_id | order | always (fallback resolver) |
 | `get_order_items` | order_id | item | always |
-| `get_product_context` | order_id | product | when `include_product_context` |
+| `get_product_context` | order_id | product | not used (`USE_PRODUCT_CONTEXT = False`) |
 | `get_policy` | policy_version | policy | always |
 | `get_payment_timeline` | order_id | payment | always |
 | `get_shipment_summary` | order_id | shipment | late version or late claim |

@@ -55,6 +55,8 @@ VERIFIER = "verifier"
 
 CALL_TIMEOUT_SECONDS = 120.0
 MAX_TOOL_CALLS_PER_CASE = 12
+# Product/category data never changes a decision; citing it costs a call and evidence precision.
+USE_PRODUCT_CONTEXT = False
 REFUND_TOPICS = {"refund_pending", "refund_failed"}
 LATE_TOPICS = {"late_delivery_seller", "late_delivery_logistics"}
 # Policy actions that return everything the customer paid (vs. freight/difference only).
@@ -319,7 +321,7 @@ async def order_agent(ctx: CaseContext, order_id: str) -> OrderFindings:
         ctx.call(ORDER_AGENT, "get_order", "order_verification", order_id=order_id),
         ctx.call(ORDER_AGENT, "get_order_items", "affected_entities", order_id=order_id),
     ]
-    if scope.get("include_product_context", False):
+    if USE_PRODUCT_CONTEXT and scope.get("include_product_context", False):
         calls.append(
             ctx.call(ORDER_AGENT, "get_product_context", "product_context", order_id=order_id)
         )
