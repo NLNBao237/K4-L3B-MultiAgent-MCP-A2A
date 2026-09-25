@@ -12,6 +12,10 @@ from mcp.client.streamable_http import streamable_http_client
 from .contracts import Contracts
 
 
+class ToolCallError(RuntimeError):
+    """The tool answered with an error (e.g. no record); retrying will not change it."""
+
+
 class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
@@ -28,7 +32,7 @@ class EvidenceGateway:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
-            raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+            raise ToolCallError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
         # Try structured_content first
         evidence = getattr(result, "structured_content", None)
         if evidence is None:

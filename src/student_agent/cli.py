@@ -40,24 +40,57 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    pending = list(case_set.case_ids)
+    received: set[str] = set()
+    failures = 0
+    while pending:
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                discovered_tools = await gateway.list_tools()
+                if not discovered_tools:
+                    raise RuntimeError("MCP Gateway returned no tools")
+                while pending:
+                    case_id = pending[0]
+                    case = case_set.cases[case_id]
+                    if case_id not in received:
+                        trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                        received.add(case_id)
+                    output = await solve_case(case, gateway, trace)
+                    contracts.validate_output(output, f"outputs/{case_id}.json")
+                    if output.get("case_id") != case_id:
+                        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                    target = output_root / f"{case_id}.json"
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+                    temporary.replace(target)
+                    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    pending.pop(0)
+                    failures = 0
+                    print(f"{case_id}: {output['assessment']['primary_issue']}", flush=True)
+        except Exception as exc:
+            if _is_fatal(exc):
+                raise
+            failures += 1
+            if failures > MAX_RECONNECTS:
+                raise RuntimeError(f"MCP connection keeps failing: {exc!r}") from exc
+            print(f"WARN: connection lost at {pending[0]} ({exc!r}); reconnecting", flush=True)
+            await asyncio.sleep(min(30, 2**failures))
+
+
+MAX_RECONNECTS = 5
+
+
+def _is_fatal(exc: BaseException) -> bool:
+    """Contract/configuration errors abort the run; transport failures are retried."""
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_fatal(inner) for inner in exc.exceptions)
+    return isinstance(exc, ValueError) or (
+        isinstance(exc, RuntimeError) and "no tools" in str(exc)
+    )
 
 
 def parser() -> argparse.ArgumentParser:

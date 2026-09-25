@@ -1,240 +1,207 @@
 # L3B Architecture Record
 
-Team: K4-TeamXX-<TenNhom>
+Team: K4-L3B
 Variant: L3B
 
 ## 1. System overview
 
+A coordinator dispatches specialist agents over an A2A message envelope. Specialists own
+disjoint MCP tools; the policy agent decides, the conflict agent reconciles sources and an
+independent verifier re-checks the assembled output before the CLI finalizes the case.
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              COORDINATOR                                    │
-│                    (solve_case entry point)                                │
-│                              │                                              │
-│            ┌─────────────────┼─────────────────┐                            │
-│            ▼                 ▼                 ▼                            │
-│    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                     │
-│    │  Entity      │  │  Order/Item  │  │  Customer    │                     │
-│    │  Resolver    │  │  Agent       │  │  Context     │                     │
-│    └──────┬───────┘  └──────┬───────┘  └──────┬───────┘                     │
-│           │                 │                 │                              │
-│           └─────────────────┼─────────────────┘                              │
-│                             ▼                                               │
-│    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                    │
-│    │  Payment     │  │  Shipment    │  │  Policy      │                    │
-│    │  Agent       │  │  Agent        │  │  Agent       │                    │
-│    └──────┬───────┘  └──────┬───────┘  └──────┬───────┘                    │
-│           │                 │                 │                              │
-│           └─────────────────┼─────────────────┘                              │
-│                             ▼                                               │
-│                    ┌──────────────┐                                         │
-│                    │  Conflict    │                                         │
-│                    │  Resolver    │                                         │
-│                    └──────┬───────┘                                         │
-│                           ▼                                                  │
-│                    ┌──────────────┐                                         │
-│                    │  Verifier    │                                         │
-│                    │  Agent       │                                         │
-│                    └──────┬───────┘                                         │
-│                           ▼                                                  │
-│                     [OUTPUT]                                                 │
-└─────────────────────────────────────────────────────────────────────────────┘
+                         ┌───────────────┐
+  case_received (CLI) ─▶ │  coordinator  │ ◀─────────────── output_verified ─────────┐
+                         └──────┬────────┘                                           │
+        resolve_entity          │ task_assigned (A2A)                                │
+          ▼                     ▼ (parallel)                                          │
+   ┌─────────────┐   ┌─────────────┐ ┌───────────────┐ ┌──────────────┐               │
+   │ entity-agent│   │ order-agent │ │ payment-agent │ │ policy-agent │               │
+   └─────┬───────┘   └─────┬───────┘ └──────┬────────┘ └──────┬───────┘               │
+         │ entity_resolved │ order_analyzed │ payment/refund    │                       │
+         └────────────────▶│◀───────────────┘  timeline         │                       │
+                           ▼ (conditional)                      │                       │
+                   ┌────────────────┐                           │                       │
+                   │ shipment-agent │ shipment_analyzed ───────▶│ issue_decided          │
+                   └────────────────┘                           ▼                       │
+                                                        ┌────────────────┐              │
+                                                        │ conflict-agent │ sources_reconciled
+                                                        └───────┬────────┘              │
+                                                                ▼                       │
+                                                           ┌──────────┐                 │
+                                                           │ verifier │ ────────────────┘
+                                                           └──────────┘
 ```
+
+Code: `src/student_agent/workflow.py` (agents, A2A, trace) and
+`src/student_agent/analysis.py` (pure, unit-tested evidence reasoning).
 
 ## 2. Agent ownership
 
-| Actor | Input | Trách nhiệm | Tool permission | Output/handoff |
-|-------|-------|-------------|------------------|----------------|
-| Coordinator | case dict | Điều phối workflow, gọi specialists | list_tools, no direct evidence | Dispatch tasks |
-| Entity Resolver | case data | Resolve order IDs từ candidate clues | get_order, get_customer_history | resolved_order_ids |
-| Order/Item Agent | order_ids | Phân tích order, items, sellers | get_order, get_item, get_seller | order_analysis |
-| Customer Context Agent | customer_id | Lịch sử mua hàng, behavior patterns | get_customer_history | customer_profile |
-| Payment Agent | order_ids, payment_refs | Phân tích capture, refunds | get_payment, get_refund | payment_verdict |
-| Shipment Agent | order_ids, shipment_ids | Timeline, delays, logistics | get_shipment | shipment_verdict |
-| Policy Agent | all analyses | Map issues → policy rules | get_policy | policy_recommendations |
-| Conflict Resolver | conflicting data | Resolve source conflicts | (no MCP tools) | resolved_conflicts |
-| Verifier Agent | all outputs | Final validation, confidence calibration | (no MCP tools) | verified_output |
+| Actor | Input | Responsibility | MCP tools | Output / handoff |
+|---|---|---|---|---|
+| coordinator | case JSON | Dispatch, decide which optional evidence is needed | none | `task_assigned` to every agent |
+| entity-agent | candidates, customer hint | Resolve the complained order, reject candidates not owned by the customer, customer context | `get_customer_history` (fallback `get_order` per well-formed candidate) | `entity_resolved` |
+| order-agent | order id | Order row, items, sellers, product context; seller verification when policy blames a seller | `get_order`, `get_order_items`, `get_product_context`, `get_sellers` (conditional) | `order_analyzed`, `seller_verified` |
+| payment-agent | order id | Captures, reconciliation events, refund lifecycle | `get_payment_timeline`, `get_refund_timeline` (conditional) | `payment_timeline_collected`, `refund_timeline_collected` |
+| shipment-agent | order id | Carrier handoff vs shipping limit, delivery vs promise, late events | `get_shipment_summary` (conditional) | `shipment_analyzed` |
+| policy-agent | all findings | Classify primary issue, apply `EC_POLICY_V2` rule | `get_policy` | `policy_decided`, `issue_decided` |
+| conflict-agent | findings | Record source disagreements and the selected source | none | `sources_reconciled` |
+| verifier | assembled output | Independent invariant checks and repair, confidence adjustment | none | `verification_completed`, `output_verified` |
 
-## 3. Entity resolution và A2A protocol
+## 3. Entity resolution and A2A protocol
 
-### Entity Resolution Strategy
+### Entity resolution
 
-1. **Direct ID extraction**: Parse case description for exact order IDs
-2. **Customer-based lookup**: If customer ID provided, fetch all orders
-3. **Candidate ranking**: Score candidates by evidence overlap
-4. **Confidence threshold**: Require ≥0.7 confidence to accept resolution
+1. Candidates = `claimed_order_id` + `candidate_order_ids`.
+2. `get_customer_history(customer_unique_id_hint)` returns the customer's authoritative orders.
+   A candidate is accepted only if it belongs to that customer; the others (e.g.
+   `candidate-001`) are listed in `rejected_candidates` **without extra calls**.
+3. If no history is available, only well-formed 32-hex candidates are verified with
+   `get_order` (malformed ids would only produce audited error calls).
+4. Status: `resolved` (one owned candidate or the claimed one), `ambiguous`, `not_found`.
 
-### A2A Message Envelope
+### Authoritative timeline
+
+The history/items/payment/shipment data of one order contains **several versions** of the
+order (one is a distractor). The version the complaint is about is the one whose
+**estimated delivery most recently matured before `opened_at`** (a customer complains after
+the promise window closes; versions purchased after the complaint or with an open promise
+cannot be its subject). Every event, capture, item shipping limit and refund is attributed
+to the version it belongs to:
+
+- timestamped events → latest version purchased not after the event;
+- refunds → the version whose capture they reverse (amount match), then time;
+- versions sharing one timestamp form an ambiguous group; the issue that the evidence
+  supports *and* the customer claimed is chosen, confidence is lowered.
+
+### A2A envelope
 
 ```python
-@dataclass
-class AgentMessage:
-    sender: str           # agent name
-    recipient: str | None  # None = broadcast
+@dataclass(frozen=True)
+class A2AMessage:
+    message_id: str       # msg-<case>-<seq>
     case_id: str
-    task_type: str        # "resolve_entity", "analyze_payment", etc.
-    payload: dict          # data being passed
-    correlation_id: str   # for tracing
+    sender: str
+    recipient: str
+    task_type: str        # entity_resolved, order_analyzed, issue_decided, ...
+    correlation_id: str   # <case>:<task_type>
+    payload: dict         # scalar summary, mirrored in trace attributes
 ```
 
-### Handoff Conditions
+Every `send` emits a `handoff` event (actor=sender, target=recipient, evidence refs used).
+
+### Handoff conditions
 
 | From | To | Condition |
-|------|----|----------|
-| Coordinator | Entity Resolver | case has no exact order_id OR needs customer context |
-| Entity Resolver | Order Agent | order_ids resolved |
-| Entity Resolver | Customer Agent | customer_unique_id needed |
-| Order Agent | Payment Agent | Payment refs found in order |
-| Order Agent | Shipment Agent | Shipment IDs found in order |
-| All Specialists | Conflict Resolver | Data conflicts detected |
-| Conflict Resolver | Verifier | All conflicts resolved |
-| Verifier | Coordinator | Output validated |
+|---|---|---|
+| coordinator | entity-agent | always first |
+| coordinator | order/payment/policy agents | order resolved (run in parallel) |
+| coordinator | shipment-agent | selected version delivered late **or** a late-delivery claim |
+| coordinator | payment-agent (refund) | refund claim, or payment evidence explains nothing and delivery was on time |
+| policy-agent | order-agent (sellers) | policy rule names a seller as responsible |
+| policy-agent | conflict-agent | issue decided |
+| conflict-agent | verifier | sources reconciled |
+| verifier | coordinator | output verified |
 
-### Timeout & Loop Prevention
+### Timeout and loop prevention
 
-- **Max agent calls per case**: 50 MCP calls total
-- **Retry budget**: 2 retries per tool with exponential backoff
-- **Loop detection**: Track (agent, task_type) pairs, fail if >3 same pair
+- Straight-line workflow (no agent re-entry, so no loops).
+- One call per (tool, arguments) per case (per-case cache); hard cap 12 calls per case.
+- Each call has a 120 s timeout. Tool errors (`is_error`, e.g. no refund record) are
+  deterministic and never retried. Transport failures abort the case; the CLI reconnects
+  (max 5 times, exponential back-off) and re-runs only that case.
 
-## 4. Evidence và conflict lifecycle
+## 4. Evidence and conflict lifecycle
 
-### Evidence Collection Rules
+- Every call carries the case's own `case_id`; refs come only from gateway responses and are
+  never edited or shared across cases (the context is created per case).
+- Each consumed result emits `tool_result_consumed` with its `evidence_ref`; the verifier
+  drops any output ref that was not consumed in this case, so every output ref is linked to
+  the trace.
+- `claim_assessments[].evidence_refs` are the refs relevant to the decided issue.
 
-1. **Always use `case_id`**: Every MCP call MUST include case_id
-2. **Store evidence_ref**: Save every returned `evidence_ref` for traceability
-3. **Single-use**: Each evidence_ref used for one purpose only
-4. **Cross-case forbidden**: Never use evidence from different cases
+| Conflict | Detection | Resolution |
+|---|---|---|
+| Several order versions in history | >1 row for the order | `LATEST_MATURED_PROMISE_BEFORE_COMPLAINT` (or `SAME_TIMESTAMP_CLAIM_VERIFIED`) |
+| `get_order` row ≠ selected version | status / purchase / delivery differ | select `get_customer_history`, `PRE_COMPLAINT_TIMELINE_AUTHORITATIVE` |
+| Late-event actor vs. shipping-limit math | both seller and logistics events | select shipping limit, `HANDOFF_VS_SHIPPING_LIMIT` |
+| Claim vs. evidence | claimed topic not among evidence signals | evidence wins, claim marked `unsupported`, lower confidence |
 
-### Evidence → Output Mapping
+## 5. Decision rules
 
-```
-MCP Tool Call → evidence_ref → stored in output.evidence_refs
-                                    ↓
-                            trace.emit(tool_result_consumed, evidence_refs=[...])
-```
+| Evidence in the selected version | Primary issue |
+|---|---|
+| status `canceled` + capture | `canceled_order_paid` |
+| status `unavailable` + capture | `unavailable_order_paid` |
+| refund event `failed` / `pending` | `refund_failed` / `refund_pending` |
+| equal captures summing to more than items total | `duplicate_charge` |
+| open `reconciliation_mismatch` | `payment_mismatch` |
+| delivered after promise, carrier handoff after shipping limit (or seller late event) | `late_delivery_seller` |
+| delivered after promise, handoff on time | `late_delivery_logistics` |
+| equal captures summing exactly to items total | `valid_split_payment` |
+| none of the above | `unsupported_claim` |
+| no order / payment evidence | `insufficient_evidence` |
 
-### Conflict Detection & Resolution
+The policy rule for the issue gives `case_status`, `recommended_action` and `refund_brl`.
+The refund is capped by `captured - refunded`; policy seller placeholders are bound to the
+seller ids observed in this case's items/sellers evidence.
 
-| Conflict Type | Detection | Resolution |
-|---------------|----------|-----------|
-| Payment amount mismatch | Compare capture vs sum(items) | Use payment capture as source of truth |
-| Delivery date conflict | Compare order vs shipment dates | Flag as "conflicting", use latest date |
-| Order status inconsistency | Compare order status vs payment status | Escalate to Conflict Resolver |
-| Missing evidence | Required field returns null | Mark as "insufficient_evidence" |
-
-## 5. Failure and efficiency policy
+## 6. Failure and efficiency policy
 
 | Failure | Retry budget | Fallback | Trace event |
-|---------|:------------:|----------|------------|
-| MCP timeout | 2 retries | Return partial with warning | tool_result_consumed + warning |
-| Entity not found | 0 retries | Mark status="not_found" | handoff with decision_code |
-| Source conflict | 1 retry | Conflict Resolver decision | policy_decided |
-| Invalid specialist result | 0 retries | Re-run specialist OR skip | verification_completed |
+|---|:---:|---|---|
+| Tool returns error (no record) | 0 | treat as "no record" | `tool_result_consumed` with `decision_code=NO_RECORD` |
+| Call timeout / transport error | case re-run after reconnect (≤5) | abort run after 5 | new `task_assigned` sequence |
+| Entity not found | 0 | `insufficient_evidence`, `needs_investigation` | `handoff entity_resolved status=not_found` |
+| Source conflict | 0 | conflict-agent decision | `handoff sources_reconciled` |
+| Invalid assembled output | 0 | verifier repairs, confidence −0.05 per fix | `verification_completed decision_code=CORRECTED` |
 
-### Efficiency Strategy
+Efficiency: 6 base calls (history, order, items, product, policy, payment timeline), plus
+shipment summary / refund timeline / sellers only when the decision needs them — 6–8 calls
+per case, never the unused `get_order_payments` (subsumed by the payment timeline) and never
+calls on malformed candidate ids.
 
-- **Cache strategy**: Cache customer → orders mapping within case
-- **Query budget**: Max 5 tool calls per entity type
-- **Parallel calls**: Independent agents can run concurrently (asyncio.gather)
-- **Early termination**: Stop when all required evidence collected
+## 7. Verification invariants
 
-## 6. Verification invariants
+- `case_id` equals the input; schema `day09-l3b-output-v2` (also validated by the CLI).
+- Output `evidence_refs` ⊆ refs consumed in this case, unique.
+- `recommended_refund_brl` ≤ captured; refund lines sum to the recommendation.
+- `no_action` ⇒ no refund; action is the policy action for the decided issue.
+- Seller parties and `late_seller_ids` ⊆ `affected_entities.seller_ids`.
+- Confidence: 0.9 when evidence and claim agree on one signal, 0.75 when evidence contradicts
+  the claim, 0.8–0.85 for multi-signal/ambiguous versions, 0.35 without core evidence.
 
-Before finalize, verify:
+## 8. Reproducibility
 
-- [ ] `case_id` matches input
-- [ ] `schema_version` = "day09-l3b-output-v2"
-- [ ] `assessment.primary_issue` is valid enum value
-- [ ] `assessment.confidence` ∈ [0, 1]
-- [ ] `affected_entities` contains at least one order_id OR reason for none
-- [ ] All `evidence_refs` are unique and non-empty
-- [ ] `data_conflicts` resolution codes are populated
-- [ ] `financial_resolution.refund_lines` sum ≤ captured_total_brl
-- [ ] `root_cause_analysis.responsible_parties` party_types are valid
-- [ ] `resolution_actions` max 8 items, unique
+- Python 3.11+, dependencies in `pyproject.toml`; native asyncio, no LLM, no randomness in
+  decisions (only trace event ids are random).
+- `day09 validate-inputs && day09 run && day09 validate && day09 package`.
+- Offline tests: `pytest -q tests/test_workflow.py` (synthetic fake gateway).
+- Cases run sequentially; calls inside one case run in parallel on one MCP session.
 
-## 7. Reproducibility
+## 9. MCP tool inventory (from `day09 mcp-tools`)
 
-- **Python**: 3.11+
-- **Framework**: Native asyncio with dataclass-based agents
-- **Dependencies**: See pyproject.toml (pinned versions)
-- **Concurrency**: Max 1 case at a time (sequential processing)
-- **Random seed**: None (deterministic)
-- **Run command**: `day09 run`
-- **Validation**: `day09 validate`
+| Tool | Args | Domain | Used |
+|---|---|---|---|
+| `get_customer_history` | customer_unique_id | customer | always |
+| `get_order` | order_id | order | always (fallback resolver) |
+| `get_order_items` | order_id | item | always |
+| `get_product_context` | order_id | product | when `include_product_context` |
+| `get_policy` | policy_version | policy | always |
+| `get_payment_timeline` | order_id | payment | always |
+| `get_shipment_summary` | order_id | shipment | late version or late claim |
+| `get_refund_timeline` | order_id | refund | refund claim or unexplained payment |
+| `get_sellers` | order_id | seller | seller-responsible issue |
+| `get_order_payments` | order_id | payment | not used (subset of timeline) |
 
-## 8. MCP Tool Inventory
+## 10. Trace events
 
-Discovered via `day09 mcp-tools`:
-
-| Tool | Domain | Primary Use |
-|------|--------|-------------|
-| get_order | order | Fetch order details by ID |
-| get_item | item | Fetch item/product details |
-| get_seller | seller | Fetch seller info |
-| get_customer_history | customer | Customer purchase history |
-| get_payment | payment | Payment capture details |
-| get_refund | refund | Refund records |
-| get_shipment | shipment | Shipment tracking/timeline |
-| get_policy | policy | Policy rules and thresholds |
-
-## 9. Output Schema Summary (L3B-specific)
-
-L3B adds to L3A:
-
-```python
-{
-    "schema_version": "day09-l3b-output-v2",
-    "case_id": str,                    # e.g., "L3B_CASE_001"
-    "assessment": {
-        "primary_issue": primaryIssue, # enum
-        "secondary_issues": [str, ...], # max 10
-        "case_status": enum,            # action_required | no_action | needs_investigation
-        "confidence": float             # 0-1
-    },
-    "affected_entities": {
-        "order_ids": [str, ...],
-        "item_ids": [str, ...],
-        "seller_ids": [str, ...],
-        "payment_references": [str, ...],
-        "shipment_ids": [str, ...]
-    },
-    "entity_resolution": {             # L3B specific
-        "status": "resolved" | "ambiguous" | "not_found",
-        "resolved_order_ids": [str, ...],
-        "rejected_candidates": [str, ...],
-        "confidence": float
-    },
-    "customer_context": {               # L3B specific
-        "customer_unique_id": str | null,
-        "related_order_ids": [str, ...]
-    },
-    "shipment_analysis": {             # L3B specific
-        "verdict": enum,
-        "late_seller_ids": [str, ...],
-        "timeline_complete": bool
-    },
-    "payment_analysis": {              # L3B specific
-        "verdict": enum,
-        "captured_total_brl": float | null,
-        "refunded_total_brl": float | null,
-        "refundable_total_brl": float | null
-    },
-    "root_cause_analysis": {...},      # shared with L3A
-    "evidence_refs": [str, ...],       # ev_... format
-    "data_conflicts": [...],            # shared with L3A
-    "financial_resolution": {...},     # shared with L3A
-    "resolution_actions": [str, ...]    # max 8
-}
-```
-
-## 10. Event Types for Trace
-
-| Event | When | Required Fields |
-|-------|------|----------------|
-| case_received | Case loaded | case_id, actor="coordinator" |
-| task_assigned | Task dispatched to agent | case_id, actor, target |
-| handoff | Control transferred | case_id, actor, target |
-| tool_result_consumed | MCP response processed | case_id, actor, tool_name, evidence_refs |
-| policy_decided | Policy applied | case_id, actor, decision_code |
-| verification_completed | Output validated | case_id, actor |
-| case_finalized | Case complete | case_id, actor="coordinator" |
+| Event | Emitted by | When |
+|---|---|---|
+| `case_received` / `case_finalized` | coordinator (CLI) | once per case, around `solve_case` |
+| `task_assigned` | coordinator | each dispatched task (`decision_code` = task type) |
+| `tool_result_consumed` | owning specialist | each MCP result, with its `evidence_ref` |
+| `handoff` | sender agent | each A2A message |
+| `policy_decided` | policy-agent | primary issue + policy action |
+| `verification_completed` | verifier | after independent checks |

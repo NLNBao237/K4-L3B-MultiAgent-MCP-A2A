@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Day09 L3B Input Validation Script
 Validates all input case files against expected schema.
@@ -11,13 +10,12 @@ Author: Team K4-L3B
 Stage: Giai đoạn 1 - Infrastructure Setup
 """
 
+import argparse
+import io
 import json
 import sys
-import io
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
-import argparse
+from pathlib import Path
 
 # Fix Windows console encoding
 if sys.platform == 'win32':
@@ -132,7 +130,7 @@ class InputValidator:
         # 7. Validate investigation_scope (optional but recommended)
         investigation_scope = case_data.get("investigation_scope", {})
         if investigation_scope:
-            for key in investigation_scope.keys():
+            for key in investigation_scope:
                 if key not in self.INVESTIGATION_SCOPE_FIELDS:
                     warnings.append(f"Unknown investigation_scope field: {key}")
 
@@ -178,7 +176,7 @@ class InputValidator:
 
         for json_file in sorted(json_files):
             try:
-                with open(json_file, "r", encoding="utf-8") as f:
+                with open(json_file, encoding="utf-8") as f:
                     case_data = json.load(f)
 
                 result = self.validate_case(case_data, json_file)
