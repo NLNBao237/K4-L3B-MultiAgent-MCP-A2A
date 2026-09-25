@@ -348,6 +348,18 @@ async def order_agent(ctx: CaseContext, order_id: str) -> OrderFindings:
     return findings
 
 
+async def product_step(ctx: CaseContext, order_id: str) -> None:
+    ctx.assign(ORDER_AGENT, "verify_product_availability", order_id=order_id)
+    await ctx.call(ORDER_AGENT, "get_product_context", "product_availability", order_id=order_id)
+    ctx.send(
+        ORDER_AGENT,
+        COORDINATOR,
+        "product_checked",
+        {"found": bool(ctx.refs("get_product_context"))},
+        ctx.refs("get_product_context"),
+    )
+
+
 async def payment_agent(ctx: CaseContext, order_id: str) -> dict[str, Any] | None:
     ctx.assign(PAYMENT_AGENT, "analyze_payment", order_id=order_id)
     timeline = await ctx.call(
@@ -483,6 +495,9 @@ async def solve_case(
         results = await asyncio.gather(*extra)
         shipment_data = results[0] if needs_shipment else None
         refund_data = results[-1] if needs_refund else None
+        if "unavailable_order_paid" in provisional:
+            # Only an unavailable order is about the product itself; cite its catalog record.
+            await product_step(ctx, order_id)
 
         findings.shipment = shipment_facts(selection.row, rows, group, order.items, shipment_data)
         findings.payments = payment_facts(rows, group, payment_data, refund_data)
@@ -684,7 +699,8 @@ def build_output(
             "verdict": pay_verdict,
             "captured_total_brl": captured,
             "refunded_total_brl": refunded,
-            "refundable_total_brl": remaining if captured is not None else None,
+            # Amount the policy makes eligible for refund (not merely what is still captured).
+            "refundable_total_brl": recommended if captured is not None else None,
         },
         "root_cause_analysis": {
             "ranked_causes": [{"cause_code": issue.upper(), "rank": 1}],
